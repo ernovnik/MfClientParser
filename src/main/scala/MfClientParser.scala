@@ -4,6 +4,9 @@ import org.apache.commons.codec.language.DoubleMetaphone
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions.{col, udf}
 
+/*Приложение для вычисления неуникального идентификатора клиента по ФИО и дате рождения
+* со линейной сложностью*/
+
 object MfClientParser extends App {
     val spark = SparkSession
       .builder
@@ -23,15 +26,24 @@ object MfClientParser extends App {
     val dm = new DoubleMetaphone()
     //Года сворачиваются в число, таким образом нам неважен порядок месяца, дня, года
     val hashDate = udf { (s: String) => s.replace("[^0-9]", "").foldLeft[Int](0)((a, b) => a + b.asDigit * 5) }
+
     val inputNames = spark.sparkContext.textFile("src/main/resources/names.csv").map(line => line.split(" ").toSeq)
+
+    /* Имена хранятся в map, все варианты написания имен приводятся к одному основному варианту*/
     val namesMap = inputNames.map(x => x(0) -> x(1)).collectAsMap()
+
+    /*Замена небуквенных символов на пробелы*/
     val nonWordCharsRemove = udf { (s: String) ⇒
       s.toLowerCase()
         .replaceAll("\\W+", " ")
         .split("\\W")
         .mkString(" ")
     }
-    val refine = udf { (s: String) =>
+
+  /*Определяет, в какой позиции имя, в какой фамилия. ФИО обычно начинается с имени, либо с фамилии
+  * Если имя на первом месте, то фамилия на третьем. Если имя на втором, то фамилия на первом.
+  * Отчество не попадает в конечную строку. Далее объединяем имя и фамилию, вычисляем double metahpone*/
+    val findNameParts = udf { (s: String) =>
       val spl = s.split("\\s")
       val nameIndex = findNamePosition(spl)
       val firstName = namesMap(spl(nameIndex))
@@ -58,7 +70,7 @@ object MfClientParser extends App {
       .withColumn("onlywordsfio", nonWordCharsRemove(col("FIO")))
       .withColumn("hdt", hashDate(col("BirthDate")))
     val df2 = df1
-      .withColumn("fio_refined", refine(col("onlywordsfio")))
+      .withColumn("fio_refined", findNameParts(col("onlywordsfio")))
     val getConcatenated = udf( (first: String, second: String) =>{(first + second).toLowerCase})
     val df3 = df2.withColumn("id", getConcatenated(col("fio_refined"),col("hdt")) )
       .drop("hdt")

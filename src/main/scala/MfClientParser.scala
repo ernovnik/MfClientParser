@@ -1,102 +1,70 @@
-import com.rockymadden.stringmetric.phonetic.RefinedSoundexAlgorithm
+package ru.spark.testapp
+
 import org.apache.commons.codec.language.DoubleMetaphone
-import org.apache.commons.lang3.StringUtils
-import org.apache.spark.ml.feature.{HashingTF, Tokenizer}
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.functions._
+import org.apache.spark.sql.functions.{col, udf}
 
 object MfClientParser extends App {
-
-  val spark = SparkSession
-    .builder
-    .master("local[*]")
-    .appName("Megafon ")
-    .config("spark.sql.warehouse.dir", ".")
-    .getOrCreate()
-  val input = "src/main/resources/data.csv"
-  val df = spark.read.option("delimiter","|")
-    .option("inferSchema", "true")
-    .option("header","true")
-    .option("DROPMALFORMED","true")
-    .option("dateFormat","yyyy.MM.dd")
-    .csv(input).toDF
-  df.show()
-
-  val dm = new DoubleMetaphone()
-
-
-
-  import org.apache.spark.sql.functions.to_timestamp
-
-  val refinedSoundex = udf{(s:String)=>  RefinedSoundexAlgorithm.compute(s)}
-
-
-
-
-  val countTokens = udf {(s:String)⇒
-
-    s.replaceAll("\\W", " ")
-      .split("\\s")
-      .filter(_.length > 2)
-      .map(dm.doubleMetaphone)
-      .mkString("#").toLowerCase
-
-  }
-
-
-
-  val nonWordCharsRemove = udf {(s:String)⇒
-
-
-    val s1 = StringUtils.stripAccents(s)
-
-
-    import org.apache.spark.ml.feature.HashingTF
-
-
-
-
-    s1
-      //.split("\\W+").
-      //map(_.trim)
-      //.mkString(" ")
-      .split("(?<=[a-z])(?=[A-Z])")
-      .filter(_.length >= 2)
-      .mkString(" ")
-      .toLowerCase()}
-
-  val hashingTF = new HashingTF().setInputCol("fiotok").setOutputCol("fiotoktf").setNumFeatures(100)
-
-
-
-
-  val tokenizer = new Tokenizer().setInputCol("FIO").setOutputCol("fiotok")
-
-  val tokenized = tokenizer.transform(df)
-
-  tokenized.show(false)
-
-
-
-
-  val df3 = df
-    .withColumn("onlywordsfio",nonWordCharsRemove(col("FIO")))
-    .withColumn("dt", to_timestamp(col("BirthDate"), "yyyy.MM.dd"))
-    .withColumn("dtStringMd5", md5(to_timestamp(col("BirthDate"), "yyyy.MM.dd").cast("String")))
-    .withColumn("dtStringSha1", substring(sha1(to_timestamp(col("BirthDate"), "yyyy.MM.dd").cast("String")),0,3))
-
-      .withColumn("FIO1", split(col("FIO"), "\\s").getItem(0))
-    .withColumn("FIO2", split(col("FIO"), "\\s").getItem(1))
-    .withColumn("FIO3", split(col("FIO"), "\\s").getItem(2))
-
-  df3.show(false)
-
-
-  val rawFeaturesDF = hashingTF.transform(tokenized)
-  rawFeaturesDF.show(false)
-
-
-
-
-  spark.stop()
+    val spark = SparkSession
+      .builder
+      .master("local[*]")
+      .appName("Megafon ")
+      .config("spark.sql.warehouse.dir", ".")
+      .getOrCreate()
+    val dataInput = "src/main/resources/data.csv"
+    val df = spark.read.option("delimiter", "|")
+      .option("inferSchema", "true")
+      .option("header", "true")
+      .option("DROPMALFORMED", "true")
+      .option("dateFormat", "yyyy.MM.dd")
+      .csv(dataInput).toDF
+    df.show()
+    //Алгоритм преобразования строк, который строки типа Ivanoff, Ivanov приводит к одной строке
+    val dm = new DoubleMetaphone()
+    //Года сворачиваются в число, таким образом нам неважен порядок месяца, дня, года
+    val hashDate = udf { (s: String) => s.replace("[^0-9]", "").foldLeft[Int](0)((a, b) => a + b.asDigit * 5) }
+    val inputNames = spark.sparkContext.textFile("src/main/resources/names.csv").map(line => line.split(" ").toSeq)
+    val namesMap = inputNames.map(x => x(0) -> x(1)).collectAsMap()
+    val nonWordCharsRemove = udf { (s: String) ⇒
+      s.toLowerCase()
+        .replaceAll("\\W+", " ")
+        .split("\\W")
+        .mkString(" ")
+    }
+    val refine = udf { (s: String) =>
+      val spl = s.split("\\s")
+      val nameIndex = findNamePosition(spl)
+      val firstName = namesMap(spl(nameIndex))
+      val secondName = (nameIndex,spl.size) match{
+        case (0,2) => spl(1)
+        case (1,2) => spl(0)
+        case (0,3) => spl(2)
+        case (1,3) => spl(0)
+        case _ => ""
+      }
+      (firstName :: secondName :: Nil).map(dm.doubleMetaphone(_)).mkString("")
+    }
+    def findNamePosition(s: Array[String]): Int = {
+      var pos = -1
+      var i = 0
+      while (i < s.size) {
+        if (namesMap.contains(s(i)))
+          pos = i
+        i += 1
+      }
+      pos
+    }
+    val df1 = df
+      .withColumn("onlywordsfio", nonWordCharsRemove(col("FIO")))
+      .withColumn("hdt", hashDate(col("BirthDate")))
+    val df2 = df1
+      .withColumn("fio_refined", refine(col("onlywordsfio")))
+    val getConcatenated = udf( (first: String, second: String) =>{(first + second).toLowerCase})
+    val df3 = df2.withColumn("id", getConcatenated(col("fio_refined"),col("hdt")) )
+      .drop("hdt")
+      .drop("fio_refined")
+      .drop("onlywordsfio")
+    val df4 = df3.select("id","FIO","BirthDate")
+    df4.show(false)
+    spark.stop()
 }
